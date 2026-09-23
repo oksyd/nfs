@@ -1,0 +1,42 @@
+name: nfs-rs
+
+services:
+  nfs:
+    build:
+      context: ../..
+      dockerfile: docker/nfs/Dockerfile
+    container_name: nfs-rs-live
+    privileged: true
+    environment:
+      NFS_EXPORT_DIR: /srv/nfs-rs/export
+      NFS_EXPORT_OPTIONS: "*(rw,sync,no_subtree_check,no_root_squash,fsid=0,insecure)"
+      MOUNTD_PORT: "20048"
+      STATD_PORT: "32765"
+      STATD_OUTGOING_PORT: "32766"
+      NFSV4_GRACE_TIME: "1"
+      NFSV4_LEASE_TIME: "10"
+      NFSD_THREADS: "8"
+    volumes:
+      - nfs-export:/srv/nfs-rs/export
+    ports:
+      - "111:111/tcp"
+      - "111:111/udp"
+      - "2049:2049/tcp"
+      - "2049:2049/udp"
+      - "20048:20048/tcp"
+      - "20048:20048/udp"
+      - "32765:32765/tcp"
+      - "32765:32765/udp"
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "rpcinfo -t 127.0.0.1 nfs 3 >/dev/null 2>&1 && rpcinfo -t 127.0.0.1 nfs 4 >/dev/null 2>&1 && showmount -e 127.0.0.1 >/dev/null 2>&1",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  nfs-export:

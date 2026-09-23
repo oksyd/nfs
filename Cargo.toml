@@ -1,0 +1,99 @@
+[package]
+name = "nfs"
+version = "0.1.4"
+edition = "2024"
+rust-version = "1.98.1"
+description = "A userspace NFSv3 and NFSv4 client library."
+license = "Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/nfs"
+keywords = ["nfs", "nfsv3", "nfsv4", "storage", "client"]
+categories = ["filesystem", "network-programming"]
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "examples/**/*.rs",
+    "src/**/*.rs",
+    "tests/**/*.rs",
+]
+
+[features]
+default = ["blocking"]
+blocking = []
+protocol = []
+tokio = ["dep:tokio"]
+
+[dependencies]
+libc = "0.2.189"
+tokio = { version = "1.53.1", optional = true, features = ["io-util", "macros", "net", "rt", "time"] }
+
+[[example]]
+name = "basic"
+path = "examples/basic.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "v3_cookbook"
+path = "examples/v3_cookbook.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "v3_exports"
+path = "examples/v3_exports.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "v3_probe"
+path = "examples/v3_probe.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "v4_basic"
+path = "examples/v4_basic.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "v4_cookbook"
+path = "examples/v4_cookbook.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "v4_probe"
+path = "examples/v4_probe.rs"
+required-features = ["blocking"]
+
+[[example]]
+name = "tokio_basic"
+path = "examples/tokio_basic.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "v3_tokio_cookbook"
+path = "examples/v3_tokio_cookbook.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "v3_tokio_exports"
+path = "examples/v3_tokio_exports.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "v3_tokio_probe"
+path = "examples/v3_tokio_probe.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "v4_tokio_basic"
+path = "examples/v4_tokio_basic.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "v4_tokio_cookbook"
+path = "examples/v4_tokio_cookbook.rs"
+required-features = ["tokio"]
+
+[[example]]
+name = "v4_tokio_probe"
+path = "examples/v4_tokio_probe.rs"
+required-features = ["tokio"]

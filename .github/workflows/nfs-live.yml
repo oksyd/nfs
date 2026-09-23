@@ -1,0 +1,31 @@
+name: NFS Live Tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  nfs-live:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Start local NFS server
+        run: docker compose -f docker/nfs/compose.yml up -d --build --wait nfs
+      - name: Run live NFSv3 and NFSv4 tests
+        env:
+          NFS_RS_V3_TARGET: 127.0.0.1:/srv/nfs-rs/export
+          NFS_RS_V4_HOST: 127.0.0.1
+          NFS_RS_TEST_PREFIX: /
+        run: cargo test --test live --all-features -- --nocapture
+      - name: Stop local NFS server
+        if: always()
+        run: docker compose -f docker/nfs/compose.yml down -v
