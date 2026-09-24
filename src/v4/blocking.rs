@@ -18,8 +18,8 @@ use crate::error::{Error, Result};
 use crate::retry::RetryPolicy;
 use crate::rpc::{Auth, AuthSys, RpcClient, max_record_size_for_payloads};
 use crate::v4::client::{
-    CopyOffloadOptions, SpaceOp, advance_offset, app_data_block_len, attrs_require_open_state,
-    cleanup_error, device_list_page_from_result, dir_page_from_entries,
+    CopyOffloadOptions, LockRegistry, LockState, SpaceOp, advance_offset, app_data_block_len,
+    attrs_require_open_state, cleanup_error, device_list_page_from_result, dir_page_from_entries,
     ensure_distinct_copy_handles, ensure_last_status, ensure_reclaim_complete, finish_with_close,
     io_advice_bitmap, io_advice_share_access, join_path, layout_iomode_share_access,
     lock_share_access, named_attr_ops, next_dir_cursor, open_cleanup_error,
@@ -78,6 +78,7 @@ pub struct ClientBuilder {
     max_dir_entries: usize,
     max_minor_version: u32,
     retry_policy: RetryPolicy,
+    automatic_lease_renewal: bool,
 }
 
 impl ClientBuilder {
@@ -98,6 +99,7 @@ impl ClientBuilder {
             max_dir_entries: NFS4_MAX_DIR_ENTRIES,
             max_minor_version: NFS4_MINOR_VERSION_LATEST,
             retry_policy: RetryPolicy::default(),
+            automatic_lease_renewal: false,
         }
     }
 
@@ -180,6 +182,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Enables background lease renewal on a separate session for the same client.
+    ///
+    /// Disabled by default. The server must support another session, and expose
+    /// its lease time. A failed heartbeat triggers recovery on the next client
+    /// operation; it cannot guarantee lock recovery after the grace period ends.
+    pub fn automatic_lease_renewal(mut self, enabled: bool) -> Self {
+        self.automatic_lease_renewal = enabled;
+        self
+    }
+
     /// Sets retry behavior for retryable transport and protocol responses.
     pub fn retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
         self.retry_policy = retry_policy;
@@ -200,6 +212,9 @@ impl ClientBuilder {
 #[derive(Debug)]
 pub struct Client {
     rpc: RpcClient,
+    locks: LockRegistry,
+    recovery_pending: bool,
+    lease_renewal: Option<super::lease::BlockingLease>,
     builder: ClientBuilder,
     client_id: u64,
     session_id: SessionId,
@@ -581,10 +596,12 @@ impl Client {
         self.root_fsinfo.as_ref()
     }
 
-    /// Recreates the session using the original builder configuration.
+    /// Recreates the session and preserves or reclaims tracked byte-range locks.
+    ///
+    /// Returns a lost-state error if the server cannot restore a lock. Such locks
+    /// are never silently acquired as new locks after their lease has expired.
     pub fn reconnect(&mut self) -> Result<()> {
-        self.recover_session()?;
-        self.refresh_root_fsinfo()
+        self.recover_session()
     }
 
     /// Updates callback program and security parameters for the backchannel.
@@ -633,21 +650,224 @@ impl Client {
     }
 
     fn recover_session(&mut self) -> Result<()> {
-        let previous_client_id = self.client_id;
-        let previous_open_seqid = self.open_seqid;
-        let previous_root_fsinfo = self.root_fsinfo.clone();
-
-        let mut rebuilt = Self::connect_session(self.builder.clone())?;
-        if rebuilt.client_id == previous_client_id {
-            rebuilt.open_seqid = previous_open_seqid;
+        // Keep this set across awaits: cancellation must not expose the old session.
+        self.recovery_pending = true;
+        let _ = self.stop_lease_renewal();
+        let mut retry = 0;
+        let mut rebuilt = loop {
+            match Self::connect_session(self.builder.clone(), false) {
+                Ok(client) => break client,
+                Err(err) if err.is_transport_failure() => {
+                    let Some(delay) = self.retry_policy.delay_for_retry(retry) else {
+                        return Err(err);
+                    };
+                    retry += 1;
+                    std::thread::sleep(delay);
+                }
+                Err(err) => return Err(err),
+            }
+        };
+        rebuilt.locks = self.locks.clone();
+        let same_client = rebuilt.client_id == self.client_id;
+        if same_client {
+            rebuilt.open_seqid = self.open_seqid;
         }
-        if let Some(fsinfo) = previous_root_fsinfo {
-            rebuilt.apply_fsinfo_limits(&fsinfo)?;
-            rebuilt.root_fsinfo = Some(fsinfo);
+        let mut states = self.locks.snapshot();
+        for (index, state) in states.iter_mut().enumerate() {
+            if state.lost.is_some() {
+                continue;
+            }
+            let recovered = if state.client_id == rebuilt.client_id {
+                rebuilt.check_recovered_lock(state).map(|()| state.clone())
+            } else {
+                rebuilt.reclaim_lock(state)
+            };
+            match recovered {
+                Ok(new_state) => *state = new_state,
+                Err(Error::NfsV4 { status, .. })
+                    if status.indicates_lost_state()
+                        || matches!(
+                            status,
+                            Status::Stale | Status::FhExpired | Status::BadHandle | Status::NoEnt
+                        ) =>
+                {
+                    state.lost = Some(status);
+                }
+                Err(err) => return Err(err),
+            }
+            // Preserve progress if a later reclaim or RECLAIM_COMPLETE is interrupted.
+            rebuilt.locks.restore(index, state.clone());
         }
+        // RFC 8881 section 8.4.2.1: reclaim OPEN and LOCK before completing recovery.
+        let response =
+            rebuilt.recovery_compound(vec![Operation::ReclaimComplete { one_fs: false }])?;
+        ensure_reclaim_complete(&response)?;
+        if self.root_fsinfo.is_some() {
+            rebuilt.refresh_recovered_fsinfo()?;
+        }
+        rebuilt.start_lease_renewal()?;
         let old = std::mem::replace(self, rebuilt);
         let _ = old.shutdown();
+        self.locks.ensure_valid()
+    }
+
+    fn refresh_recovered_fsinfo(&mut self) -> Result<()> {
+        let response = self.recovery_compound(vec![
+            Operation::PutRootFh,
+            Operation::GetAttr(Bitmap::from_known_attrs(&[FATTR4_SUPPORTED_ATTRS])),
+        ])?;
+        response.ensure_ok()?;
+        let supported = response_getattr(&response)?.parse_supported_attrs()?;
+        let attrmask = Bitmap::from_supported_attrs(&supported, FATTR4_FSINFO_ATTRS)?;
+        let attrs = if attrmask.is_empty() {
+            Fattr {
+                attrmask,
+                attr_vals: Vec::new(),
+            }
+        } else {
+            let response =
+                self.recovery_compound(vec![Operation::PutRootFh, Operation::GetAttr(attrmask)])?;
+            response.ensure_ok()?;
+            response_getattr(&response)?
+        };
+        let fsinfo = attrs.parse_fsinfo()?;
+        self.apply_fsinfo_limits(&fsinfo)?;
+        self.root_fsinfo = Some(fsinfo);
         Ok(())
+    }
+
+    fn check_revoked_locks(&mut self) -> Result<()> {
+        for (index, mut lock) in self.locks.snapshot().into_iter().enumerate() {
+            if lock.lost.is_some() {
+                continue;
+            }
+            let ids = vec![lock.open_stateid, lock.lock_stateid];
+            let response = self.recovery_compound(vec![Operation::TestStateIds(ids.clone())])?;
+            response.ensure_ok()?;
+            let statuses = response_test_stateids(&response, ids.len())?;
+            for (id, status) in ids.into_iter().zip(statuses) {
+                if !status.is_ok() {
+                    lock.lost = Some(status);
+                    self.locks.restore(index, lock.clone());
+                    // Acknowledge revoked state so SEQUENCE need not keep reporting it.
+                    let _ = self.recovery_compound(vec![Operation::FreeStateId(id)]);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn check_recovered_lock(&mut self, lock: &LockState) -> Result<()> {
+        let response = self.recovery_compound(vec![Operation::TestStateIds(vec![
+            lock.open_stateid,
+            lock.lock_stateid,
+        ])])?;
+        response.ensure_ok()?;
+        let statuses = response_test_stateids(&response, 2)?;
+        for status in statuses {
+            if !status.is_ok() {
+                return Err(Error::nfsv4("TEST_STATEID", status));
+            }
+        }
+        Ok(())
+    }
+
+    fn reclaim_lock(&mut self, lock: &LockState) -> Result<LockState> {
+        let response = self.recovery_compound(vec![
+            Operation::PutFh(lock.handle.clone()),
+            Operation::Open(OpenArgs {
+                seqid: self.current_open_seqid(),
+                share_access: lock_share_access(lock.lock_type) | OPEN4_SHARE_ACCESS_WANT_NO_DELEG,
+                share_deny: OPEN4_SHARE_DENY_NONE,
+                owner: OpenOwner {
+                    client_id: self.client_id,
+                    owner: lock.open_owner.clone(),
+                },
+                openhow: OpenHow::NoCreate,
+                claim: OpenClaim::Previous(OpenDelegationType::None),
+            }),
+        ])?;
+        if response_consumed_owner_seqid(&response, OpCode::Open) {
+            self.advance_open_seqid();
+        }
+        response.ensure_ok()?;
+        let open = response_open(&response)?;
+        if let Some(stateid) = validate_open_result(&open, self.minor_version)? {
+            self.recovery_compound(vec![
+                Operation::PutFh(lock.handle.clone()),
+                Operation::DelegReturn(stateid),
+            ])?
+            .ensure_ok()?;
+        }
+        let response = self.recovery_compound(vec![
+            Operation::PutFh(lock.handle.clone()),
+            Operation::Lock(LockArgs {
+                lock_type: lock.lock_type,
+                reclaim: true,
+                offset: lock.offset,
+                length: lock.length,
+                locker: Locker::New {
+                    open_seqid: self.current_open_seqid(),
+                    open_stateid: open.stateid,
+                    lock_seqid: 1,
+                    lock_owner: LockOwner {
+                        client_id: self.client_id,
+                        owner: lock.owner.clone(),
+                    },
+                },
+            }),
+        ])?;
+        if response_consumed_owner_seqid(&response, OpCode::Lock) {
+            self.advance_open_seqid();
+        }
+        match response.ensure_ok().and_then(|()| response_lock(&response)) {
+            Ok(lock_stateid) => Ok(LockState {
+                client_id: self.client_id,
+                open_stateid: open.stateid,
+                lock_stateid,
+                lock_seqid: 2,
+                ..lock.clone()
+            }),
+            Err(err) => {
+                let _ = self.recovery_compound(vec![
+                    Operation::PutFh(lock.handle.clone()),
+                    Operation::Close {
+                        seqid: self.current_open_seqid(),
+                        stateid: open.stateid,
+                    },
+                ]);
+                self.advance_open_seqid();
+                Err(err)
+            }
+        }
+    }
+
+    // Recovery RPCs never recursively create another session.
+    fn recovery_compound(&mut self, operations: Vec<Operation>) -> Result<CompoundResponse> {
+        validate_session_compound_operation_count(operations.len(), self.max_operations)?;
+        let mut retry = 0;
+        loop {
+            let mut compound = vec![Operation::Sequence(SequenceArgs {
+                session_id: self.session_id,
+                sequence_id: self.sequence_id,
+                slot_id: 0,
+                highest_slot_id: 0,
+                cache_this: false,
+            })];
+            compound.extend(operations.iter().cloned());
+            let response = self.raw_compound("nfs-rs-recovery", self.minor_version, compound)?;
+            if sequence_succeeded(&response) {
+                self.sequence_id = self.sequence_id.wrapping_add(1).max(1);
+            }
+            if response_allows_delayed_retry(&operations, &response)
+                && let Some(delay) = self.retry_policy.delay_for_retry(retry)
+            {
+                retry += 1;
+                std::thread::sleep(delay);
+                continue;
+            }
+            return Ok(response);
+        }
     }
 
     /// Checks server-granted access bits for a path.
@@ -835,11 +1055,12 @@ impl Client {
             path,
             lock_share_access(lock_type),
             OpenHow::NoCreate,
-            open_owner,
+            open_owner.clone(),
         )?;
         let result = self.lock_opened(&opened, lock_type, offset, length, owner.clone());
         match result {
-            Ok((lock_stateid, lock_seqid)) => Ok(ByteRangeLock {
+            Ok((lock_stateid, lock_seqid)) => Ok(self.locks.register(LockState {
+                client_id: self.client_id,
                 handle: opened.handle,
                 open_stateid: opened.stateid,
                 lock_stateid,
@@ -848,7 +1069,9 @@ impl Client {
                 offset,
                 length,
                 owner,
-            }),
+                open_owner,
+                lost: None,
+            })),
             Err(err) => Err(cleanup_error(
                 err,
                 "cleanup CLOSE after failed LOCK",
@@ -859,17 +1082,36 @@ impl Client {
 
     /// Releases an active NFSv4 byte-range lock.
     pub fn unlock(&mut self, lock: ByteRangeLock) -> Result<()> {
-        let owner = lock.owner.clone();
+        let state = self.locks.get(&lock)?;
+        // Releasing a lock relinquishes our claim to it even if the reply is lost.
+        // A recovery triggered by LOCKU must never reclaim this released range.
+        self.locks.remove(&lock);
+        if let Some(status) = state.lost {
+            if state.client_id == self.client_id {
+                let _ = self.recovery_compound(vec![
+                    Operation::PutFh(state.handle),
+                    Operation::Close {
+                        seqid: self.current_open_seqid(),
+                        stateid: state.open_stateid,
+                    },
+                ]);
+                self.advance_open_seqid();
+            }
+            return Err(Error::LockLost { status });
+        }
         let opened = OpenedFile {
-            handle: lock.handle.clone(),
-            stateid: lock.open_stateid,
+            handle: state.handle.clone(),
+            stateid: state.open_stateid,
         };
-        let result = self
-            .unlock_opened(&lock)
-            .and_then(|stateid| self.free_stateid(stateid))
-            .and_then(|()| self.release_lock_owner(owner).map(|_| ()));
+        let result = match self.unlock_opened(&state) {
+            Ok(stateid) => match self.free_stateid(stateid) {
+                Ok(()) => self.release_lock_owner(state.owner).map(|_| ()),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        };
         let close_result = self.close(opened);
-        finish_with_close(result.map(|_| ()), close_result)
+        finish_with_close(result, close_result)
     }
 
     /// Releases server-side state associated with a stateid.
@@ -3213,6 +3455,58 @@ impl Client {
         }
     }
 
+    /// Suggested heartbeat interval derived from the server's advertised lease.
+    pub fn lease_renewal_interval(&self) -> Option<Duration> {
+        self.root_fsinfo
+            .as_ref()?
+            .lease_time_seconds
+            .filter(|seconds| *seconds > 0)
+            .map(|seconds| Duration::from_secs(u64::from(seconds)) / 3)
+    }
+
+    fn stop_lease_renewal(&mut self) -> Result<()> {
+        if let Some(lease) = self.lease_renewal.take() {
+            let session_id = lease.stop();
+            let response = self.raw_compound(
+                "destroy-lease-session",
+                self.minor_version,
+                vec![Operation::DestroySession(session_id)],
+            )?;
+            if !matches!(response.status, Status::BadSession | Status::DeadSession) {
+                response.ensure_ok()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn start_lease_renewal(&mut self) -> Result<()> {
+        if !self.builder.automatic_lease_renewal {
+            return Ok(());
+        }
+        let interval = self.lease_renewal_interval().ok_or_else(|| {
+            Error::Protocol("server did not advertise a usable NFSv4 lease time".into())
+        })?;
+        let mut builder = self.builder.clone();
+        builder.automatic_lease_renewal = false;
+        builder.timeout = Some(builder.timeout.unwrap_or(interval).min(interval));
+        let mut keeper = Self::connect_session(builder, false)?;
+        if keeper.client_id != self.client_id {
+            let _ = keeper.shutdown();
+            return Err(Error::nfsv4("EXCHANGE_ID", Status::StaleClientId));
+        }
+        self.lease_renewal = Some(super::lease::BlockingLease::start(
+            interval,
+            keeper.session_id,
+            move || {
+                keeper.recovery_compound(Vec::new()).is_ok_and(|response| {
+                    response.status.is_ok()
+                        && crate::v4::client::response_revoked_lock_status(&response).is_none()
+                })
+            },
+        )?);
+        Ok(())
+    }
+
     /// Sends an empty COMPOUND to keep the session lease fresh.
     pub fn renew(&mut self) -> Result<()> {
         self.compound(Vec::new()).map(|_| ())
@@ -3223,6 +3517,7 @@ impl Client {
     /// Dropping the client closes the TCP connection, but explicit shutdown is
     /// preferred when the server should release session resources promptly.
     pub fn shutdown(mut self) -> Result<()> {
+        self.stop_lease_renewal()?;
         let response = self.raw_compound(
             "destroy-session",
             self.minor_version,
@@ -3233,6 +3528,7 @@ impl Client {
 
     /// Destroys the session and then the NFSv4 client id.
     pub fn destroy_client_id(mut self) -> Result<()> {
+        self.stop_lease_renewal()?;
         let session_response = self.raw_compound(
             "destroy-session",
             self.minor_version,
@@ -3257,6 +3553,22 @@ impl Client {
         validate_session_compound_operation_count(operations.len(), self.max_operations)?;
         let can_replay_after_session_recovery =
             operations_can_replay_after_session_recovery(&operations);
+        if self
+            .lease_renewal
+            .as_ref()
+            .is_some_and(|lease| lease.failed())
+        {
+            self.recovery_pending = true;
+        }
+        if self.recovery_pending {
+            self.recover_session()?;
+            if !can_replay_after_session_recovery {
+                return Err(Error::nfsv4("SEQUENCE", Status::BadSession));
+            }
+        }
+        if !crate::v4::client::operations_release_state(&operations) {
+            self.locks.ensure_valid()?;
+        }
         let mut retry = 0;
         let mut recovered_session = false;
         loop {
@@ -3270,9 +3582,29 @@ impl Client {
             }));
             with_sequence.extend(operations.iter().cloned());
 
-            let response = self.raw_compound("nfs-rs-v4", self.minor_version, with_sequence)?;
+            let response = match self.raw_compound("nfs-rs-v4", self.minor_version, with_sequence) {
+                Ok(response) => response,
+                Err(err) if err.is_transport_failure() && !recovered_session => {
+                    self.recovery_pending = true;
+                    if let Err(recovery) = self.recover_session() {
+                        return Err(cleanup_error(err, "NFSv4 session recovery", Err(recovery)));
+                    }
+                    recovered_session = true;
+                    if can_replay_after_session_recovery {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                Err(err) => return Err(err),
+            };
             if sequence_succeeded(&response) {
                 self.sequence_id = self.sequence_id.wrapping_add(1).max(1);
+            }
+            if crate::v4::client::response_revoked_lock_status(&response).is_some() {
+                self.check_revoked_locks()?;
+                if !crate::v4::client::operations_release_state(&operations) {
+                    self.locks.ensure_valid()?;
+                }
             }
             if response_requires_session_recovery(&response) && !recovered_session {
                 let err = session_recovery_error(&response);
@@ -3295,7 +3627,7 @@ impl Client {
     }
 
     fn connect_with_builder(builder: ClientBuilder) -> Result<Self> {
-        let mut client = Self::connect_session(builder)?;
+        let mut client = Self::connect_session(builder, true)?;
         if let Err(err) = client.refresh_root_fsinfo() {
             return Err(cleanup_error(
                 err,
@@ -3303,10 +3635,17 @@ impl Client {
                 client.shutdown(),
             ));
         }
+        if let Err(err) = client.start_lease_renewal() {
+            return Err(cleanup_error(
+                err,
+                "cleanup session after lease renewal setup",
+                client.shutdown(),
+            ));
+        }
         Ok(client)
     }
 
-    fn connect_session(builder: ClientBuilder) -> Result<Self> {
+    fn connect_session(builder: ClientBuilder, complete_reclaim: bool) -> Result<Self> {
         validate_host(&builder.host)?;
         validate_port("port", builder.port)?;
         validate_owner_id(&builder.owner_id)?;
@@ -3319,7 +3658,7 @@ impl Client {
 
         let mut last_minor_error = None;
         for minor_version in negotiated_minor_versions(builder.max_minor_version) {
-            match Self::connect_session_minor(builder.clone(), minor_version) {
+            match Self::connect_session_minor(builder.clone(), minor_version, complete_reclaim) {
                 Ok(client) => return Ok(client),
                 Err(err) if is_minor_version_mismatch(&err) => {
                     last_minor_error = Some(err);
@@ -3333,7 +3672,11 @@ impl Client {
         }))
     }
 
-    fn connect_session_minor(builder: ClientBuilder, minor_version: u32) -> Result<Self> {
+    fn connect_session_minor(
+        builder: ClientBuilder,
+        minor_version: u32,
+        complete_reclaim: bool,
+    ) -> Result<Self> {
         let stored_builder = builder.clone();
         let mut rpc = RpcClient::connect_with_timeout(
             (builder.host.as_str(), builder.port),
@@ -3405,16 +3748,26 @@ impl Client {
         let max_request_size = session.fore_channel_attrs.max_request_size;
         let max_response_size = session.fore_channel_attrs.max_response_size;
         let mut sequence_id = 1;
-        let reclaim_res = match reclaim_complete_with_delayed_retry(
-            &mut rpc,
-            minor_version,
-            session.session_id,
-            &mut sequence_id,
-            max_operations,
-            builder.retry_policy,
-        ) {
-            Ok(response) => response,
-            Err(err) => {
+        if complete_reclaim {
+            let reclaim_res = match reclaim_complete_with_delayed_retry(
+                &mut rpc,
+                minor_version,
+                session.session_id,
+                &mut sequence_id,
+                max_operations,
+                builder.retry_policy,
+            ) {
+                Ok(response) => response,
+                Err(err) => {
+                    return Err(cleanup_session_setup_error(
+                        &mut rpc,
+                        minor_version,
+                        session.session_id,
+                        err,
+                    ));
+                }
+            };
+            if let Err(err) = ensure_reclaim_complete(&reclaim_res) {
                 return Err(cleanup_session_setup_error(
                     &mut rpc,
                     minor_version,
@@ -3422,18 +3775,13 @@ impl Client {
                     err,
                 ));
             }
-        };
-        if let Err(err) = ensure_reclaim_complete(&reclaim_res) {
-            return Err(cleanup_session_setup_error(
-                &mut rpc,
-                minor_version,
-                session.session_id,
-                err,
-            ));
         }
 
         let client = Self {
             rpc,
+            locks: LockRegistry::default(),
+            recovery_pending: false,
+            lease_renewal: None,
             builder: stored_builder,
             client_id: exchange.client_id,
             session_id: session.session_id,
@@ -3981,7 +4329,7 @@ impl Client {
         }
     }
 
-    fn unlock_opened(&mut self, lock: &ByteRangeLock) -> Result<StateId> {
+    fn unlock_opened(&mut self, lock: &LockState) -> Result<StateId> {
         let mut retry = 0;
         let mut lock_seqid = lock.lock_seqid;
         loop {
@@ -4537,5 +4885,140 @@ mod tests {
             .open_owner(vec![0; NFS4_OPAQUE_LIMIT + 1])
             .connect();
         assert!(matches!(result, Err(Error::Protocol(_))));
+    }
+}
+
+#[cfg(test)]
+mod recovery_regressions {
+    use super::*;
+    use crate::v4::recovery_tests::{disconnect_script, lock_state, restart_script, stateid};
+
+    fn builder(addr: std::net::SocketAddr) -> ClientBuilder {
+        Client::builder("127.0.0.1")
+            .port(addr.port())
+            .owner_id(b"client".to_vec())
+            .client_owner_verifier([0; 8])
+            .timeout(Some(Duration::from_secs(2)))
+    }
+
+    #[test]
+    fn restart_reclaims_open_and_lock_before_reclaim_complete() {
+        let server = restart_script(None);
+        let mut client = Client::connect_session(builder(server.addr), true).unwrap();
+        let lock = client.locks.register(lock_state());
+        client.recover_session().unwrap();
+        assert_eq!(lock.stateid(), stateid(22));
+        assert!(!lock.is_lost());
+        client.renew().unwrap();
+        client.unlock(lock).unwrap();
+        drop(client);
+        server.finish();
+    }
+
+    #[test]
+    fn expired_grace_reports_lost_lock_and_blocks_further_io() {
+        let server = restart_script(Some(Status::NoGrace));
+        let mut client = Client::connect_session(builder(server.addr), true).unwrap();
+        let lock = client.locks.register(lock_state());
+        assert!(client.recover_session().unwrap_err().is_lost_state());
+        assert!(lock.is_lost());
+        assert!(client.renew().unwrap_err().is_lost_state());
+        assert!(client.unlock(lock).unwrap_err().is_lost_state());
+        client.locks.ensure_valid().unwrap();
+        drop(client);
+        server.finish();
+    }
+
+    #[test]
+    fn read_only_rpc_recovers_after_disconnect() {
+        let (server, ops) = disconnect_script(false);
+        let mut client = Client::connect_session(builder(server.addr), true).unwrap();
+        client.compound(ops).unwrap();
+        drop(client);
+        server.finish();
+    }
+
+    #[test]
+    fn mutation_with_lost_reply_is_not_replayed() {
+        let (server, ops) = disconnect_script(true);
+        let mut client = Client::connect_session(builder(server.addr), true).unwrap();
+        let err = client.compound(ops).unwrap_err();
+        assert!(err.is_outcome_unknown());
+        assert!(!err.is_retryable());
+        drop(client);
+        server.finish();
+    }
+    #[test]
+    fn session_reconnect_preserves_existing_locks() {
+        let server = crate::v4::recovery_tests::same_client_script();
+        let mut client = Client::connect_session(builder(server.addr), true).unwrap();
+        let lock = client.locks.register(lock_state());
+        client.recover_session().unwrap();
+        assert_eq!(lock.stateid(), stateid(5));
+        assert!(!lock.is_lost());
+        client.unlock(lock).unwrap();
+        drop(client);
+        server.finish();
+    }
+
+    #[test]
+    fn background_renewal_uses_separate_session_and_shuts_it_down() {
+        let (server, observed) = crate::v4::recovery_tests::lease_script();
+        let mut client =
+            Client::connect_session(builder(server.addr).automatic_lease_renewal(true), true)
+                .unwrap();
+        client.root_fsinfo = Some(
+            Fattr {
+                attrmask: Bitmap::from_attrs(&[FATTR4_LEASE_TIME]).unwrap(),
+                attr_vals: 1_u32.to_be_bytes().to_vec(),
+            }
+            .parse_fsinfo()
+            .unwrap(),
+        );
+        client.start_lease_renewal().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !observed.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "no idle heartbeat");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        client.shutdown().unwrap();
+        server.finish();
+    }
+    #[test]
+    fn interrupted_recovery_keeps_successfully_reclaimed_state() {
+        let server = crate::v4::recovery_tests::interrupted_reclaim_script();
+        let mut client = Client::connect_session(builder(server.addr), true).unwrap();
+        let lock = client.locks.register(lock_state());
+        assert!(client.recover_session().unwrap_err().is_outcome_unknown());
+        assert!(client.recovery_pending);
+        client.recover_session().unwrap();
+        assert_eq!(lock.stateid(), stateid(22));
+        client.renew().unwrap();
+        drop(client);
+        server.finish();
+    }
+
+    #[test]
+    fn partial_revocation_checks_actual_state_and_acknowledges_only_lost_locks() {
+        for lost in [false, true] {
+            let server = crate::v4::recovery_tests::revocation_script(lost);
+            let mut client = Client::connect_session(builder(server.addr), true).unwrap();
+            let lock = client.locks.register(lock_state());
+            let result = client.renew();
+            assert_eq!(lock.is_lost(), lost);
+            if lost {
+                assert!(result.unwrap_err().is_lost_state());
+            } else {
+                result.unwrap();
+            }
+            let result = client.unlock(lock);
+            if lost {
+                assert!(result.unwrap_err().is_lost_state());
+            } else {
+                result.unwrap();
+            }
+            drop(client);
+            server.finish();
+        }
     }
 }

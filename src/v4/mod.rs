@@ -19,7 +19,11 @@ use crate::error::{Error, Result};
 #[cfg(feature = "blocking")]
 pub mod blocking;
 mod client;
+#[cfg(any(feature = "blocking", feature = "tokio"))]
+mod lease;
 mod proto;
+#[cfg(all(test, any(feature = "blocking", feature = "tokio")))]
+mod recovery_tests;
 
 #[cfg(feature = "tokio")]
 pub mod tokio;

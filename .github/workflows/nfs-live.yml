@@ -18,6 +18,8 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install 1.98.1 --profile minimal && rustup default 1.98.1
       - uses: Swatinem/rust-cache@v2
+      - name: Run unit and recovery tests
+        run: cargo test --lib --all-features
       - name: Start local NFS server
         run: docker compose -f docker/nfs/compose.yml up -d --build --wait nfs
       - name: Run live NFSv3 and NFSv4 tests

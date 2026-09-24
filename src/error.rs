@@ -33,6 +33,16 @@ pub enum Error {
     },
     /// Protocol-level invariant violation detected by the client.
     Protocol(String),
+    /// An interrupted RPC left the stream unusable. Reconnect before reuse.
+    RpcConnectionInvalid,
+    /// The server may have executed a request whose reply was not received.
+    /// Reconcile application state before retrying a mutating operation.
+    OutcomeUnknown(Box<Error>),
+    /// A previously granted NFSv4 lock could not be preserved or reclaimed.
+    LockLost {
+        /// Server status explaining why the old lock is no longer valid.
+        status: crate::v4::Status,
+    },
     /// Primary operation failed and a best-effort cleanup operation also failed.
     Cleanup {
         /// Cleanup step that failed.
@@ -106,6 +116,25 @@ pub enum Error {
 }
 
 impl Error {
+    /// Returns true when a request may have executed despite returning an error.
+    pub fn is_outcome_unknown(&self) -> bool {
+        match self {
+            Self::OutcomeUnknown(_) => true,
+            Self::Cleanup { primary, .. } => primary.is_outcome_unknown(),
+            _ => false,
+        }
+    }
+
+    #[cfg(any(feature = "blocking", feature = "tokio"))]
+    pub(crate) fn is_transport_failure(&self) -> bool {
+        match self {
+            Self::RpcConnectionInvalid => true,
+            Self::Io(err) => is_retryable_io_error(err.kind()),
+            Self::OutcomeUnknown(err) => err.is_transport_failure(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn nfs(procedure: &'static str, status: crate::v3::NfsStatus) -> Self {
         Self::Nfs { procedure, status }
     }
@@ -172,6 +201,8 @@ impl Error {
     /// This covers transient I/O failures, NFSv3 `Jukebox`, and NFSv4
     /// `Delay` or `Grace`. Session recovery statuses are handled internally by
     /// NFSv4 clients only when the operation is safe to replay.
+    /// Requests with an unknown outcome are excluded even when the underlying
+    /// I/O failure is transient, since retrying a write may duplicate its effects.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Cleanup { primary, .. } => primary.is_retryable(),
@@ -255,7 +286,10 @@ impl Error {
     /// Returns true for NFSv4 statuses indicating lost open or lock state.
     pub fn is_lost_state(&self) -> bool {
         match self {
-            Self::Cleanup { primary, .. } => primary.is_lost_state(),
+            Self::LockLost { .. } => true,
+            Self::Cleanup {
+                primary, cleanup, ..
+            } => primary.is_lost_state() || cleanup.is_lost_state(),
             Self::NfsV4 { status, .. } => status.indicates_lost_state(),
             _ => false,
         }
@@ -299,6 +333,7 @@ fn is_retryable_io_error(kind: std::io::ErrorKind) -> bool {
             | std::io::ErrorKind::UnexpectedEof
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
             | std::io::ErrorKind::BrokenPipe
             | std::io::ErrorKind::NotConnected
     )
@@ -318,6 +353,11 @@ impl fmt::Display for Error {
                 write!(f, "length {len} cannot be represented on the wire")
             }
             Self::Protocol(message) => write!(f, "protocol error: {message}"),
+            Self::RpcConnectionInvalid => {
+                write!(f, "RPC connection interrupted; reconnect before reuse")
+            }
+            Self::OutcomeUnknown(error) => write!(f, "RPC outcome unknown: {error}"),
+            Self::LockLost { status } => write!(f, "NFSv4 lock lost: {status:?}"),
             Self::Cleanup {
                 context,
                 primary,
@@ -377,6 +417,7 @@ impl std::error::Error for Error {
         match self {
             Self::Io(err) => Some(err),
             Self::Xdr(err) => Some(err),
+            Self::OutcomeUnknown(err) => Some(err.as_ref()),
             Self::Cleanup { primary, .. } => Some(primary),
             _ => None,
         }

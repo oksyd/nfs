@@ -623,6 +623,7 @@ impl Status {
                 | Self::ConnNotBoundToSession
                 | Self::DeadSession
                 | Self::StaleClientId
+                | Self::Expired
         )
     }
 

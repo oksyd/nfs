@@ -17,6 +17,7 @@ pub(crate) struct RpcClient {
     auth: Auth,
     max_record_size: usize,
     timeout: Option<Duration>,
+    interrupted: bool,
 }
 
 impl RpcClient {
@@ -33,6 +34,7 @@ impl RpcClient {
             auth,
             max_record_size: DEFAULT_MAX_RECORD_SIZE,
             timeout,
+            interrupted: false,
         })
     }
 
@@ -53,11 +55,35 @@ impl RpcClient {
         procedure: u32,
         args: &T,
     ) -> Result<Vec<u8>> {
+        if self.interrupted {
+            return Err(Error::RpcConnectionInvalid);
+        }
         let xid = self.next_xid();
         let request = encode_call(xid, program, version, procedure, &self.auth, args)?;
-        self.write_record(&request).await?;
-        let reply = self.read_record().await?;
-        decode_reply(xid, &reply)
+        // This stays set if the future is cancelled during either await.
+        self.interrupted = true;
+        self.write_record(&request)
+            .await
+            .map_err(|err| Error::OutcomeUnknown(Box::new(err)))?;
+        let reply = self
+            .read_record()
+            .await
+            .map_err(|err| Error::OutcomeUnknown(Box::new(err)))?;
+        match decode_reply(xid, &reply) {
+            Ok(payload) => {
+                self.interrupted = false;
+                Ok(payload)
+            }
+            Err(
+                err @ (Error::RpcDenied { .. }
+                | Error::RpcAcceptedError { .. }
+                | Error::RpcProgramMismatch { .. }),
+            ) => {
+                self.interrupted = false;
+                Err(err)
+            }
+            Err(err) => Err(Error::OutcomeUnknown(Box::new(err))),
+        }
     }
 
     fn next_xid(&mut self) -> u32 {
@@ -209,5 +235,60 @@ mod tests {
             Error::Protocol(message) if message.contains("zero-length non-final")
         ));
         accept.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod interruption_tests {
+    use super::*;
+    use ::tokio::net::TcpListener;
+
+    async fn interrupted_reply(external_cancel: bool) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut marker = [0; 4];
+            stream.read_exact(&mut marker).await.unwrap();
+            let mut request = vec![0; (u32::from_be_bytes(marker) & FRAGMENT_LEN_MASK) as usize];
+            stream.read_exact(&mut request).await.unwrap();
+            stream.write_all(&[0x80, 0]).await.unwrap();
+            assert_eq!(stream.read(&mut [0; 1]).await.unwrap(), 0);
+        });
+        let timeout = if external_cancel {
+            None
+        } else {
+            Some(Duration::from_millis(50))
+        };
+        let mut client = RpcClient::connect_with_timeout(addr, Auth::none(), timeout)
+            .await
+            .unwrap();
+        if external_cancel {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), client.call(1, 1, 0, &()))
+                    .await
+                    .is_err()
+            );
+        } else {
+            let error = client.call(1, 1, 0, &()).await.unwrap_err();
+            assert!(error.is_outcome_unknown());
+            assert!(!error.is_retryable());
+        }
+        assert!(matches!(
+            client.call(1, 1, 0, &()).await,
+            Err(Error::RpcConnectionInvalid)
+        ));
+        drop(client);
+        peer.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn partial_reply_timeout_requires_reconnect() {
+        interrupted_reply(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancellation_requires_reconnect() {
+        interrupted_reply(true).await;
     }
 }

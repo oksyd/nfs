@@ -1,6 +1,7 @@
 #![cfg_attr(not(any(feature = "blocking", feature = "tokio")), allow(dead_code))]
 
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
@@ -11,6 +12,26 @@ pub(crate) fn sequence_succeeded(response: &CompoundResponse) -> bool {
         response.results.first(),
         Some(OperationResult::Sequence { status, .. }) if status.is_ok()
     )
+}
+
+pub(crate) fn response_revoked_lock_status(response: &CompoundResponse) -> Option<Status> {
+    let Some(OperationResult::Sequence {
+        result: Some(sequence),
+        ..
+    }) = response.results.first()
+    else {
+        return None;
+    };
+    if sequence.status_flags & SEQ4_STATUS_ADMIN_STATE_REVOKED != 0 {
+        Some(Status::AdminRevoked)
+    } else if sequence.status_flags
+        & (SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED | SEQ4_STATUS_EXPIRED_SOME_STATE_REVOKED)
+        != 0
+    {
+        Some(Status::Expired)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn response_allows_delayed_retry(
@@ -206,6 +227,20 @@ pub(crate) fn operations_can_replay_after_session_recovery(operations: &[Operati
     operations
         .iter()
         .all(operation_can_replay_after_session_recovery)
+}
+
+pub(crate) fn operations_release_state(operations: &[Operation]) -> bool {
+    !operations.is_empty()
+        && operations.iter().all(|operation| {
+            matches!(
+                operation,
+                Operation::PutFh(_)
+                    | Operation::Close { .. }
+                    | Operation::LockUnlock(_)
+                    | Operation::FreeStateId(_)
+                    | Operation::ReleaseLockOwner(_)
+            )
+        })
 }
 
 fn operation_can_replay_after_session_recovery(operation: &Operation) -> bool {
@@ -481,6 +516,17 @@ pub(crate) struct CopyOffloadOptions {
 /// range is no longer needed.
 #[derive(Debug)]
 pub struct ByteRangeLock {
+    pub(crate) state: Arc<Mutex<LockState>>,
+    lock_type: LockType,
+    offset: u64,
+    length: u64,
+    owner: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LockState {
+    pub(crate) client_id: u64,
+    pub(crate) open_owner: Vec<u8>,
     pub(crate) handle: FileHandle,
     pub(crate) open_stateid: StateId,
     pub(crate) lock_stateid: StateId,
@@ -489,6 +535,66 @@ pub struct ByteRangeLock {
     pub(crate) offset: u64,
     pub(crate) length: u64,
     pub(crate) owner: Vec<u8>,
+    pub(crate) lost: Option<Status>,
+}
+
+/// Authoritative lock state is shared with tokens so recovery updates the
+/// stateids observed by callers without requiring them to replace their tokens.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LockRegistry {
+    entries: Vec<Arc<Mutex<LockState>>>,
+}
+
+impl LockRegistry {
+    pub(crate) fn register(&mut self, state: LockState) -> ByteRangeLock {
+        let lock = ByteRangeLock {
+            lock_type: state.lock_type,
+            offset: state.offset,
+            length: state.length,
+            owner: state.owner.clone(),
+            state: Arc::new(Mutex::new(state)),
+        };
+        self.entries.push(lock.state.clone());
+        lock
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<LockState> {
+        self.entries
+            .iter()
+            .map(|entry| entry.lock().unwrap().clone())
+            .collect()
+    }
+
+    pub(crate) fn restore(&self, index: usize, state: LockState) {
+        *self.entries[index].lock().unwrap() = state;
+    }
+
+    pub(crate) fn get(&self, lock: &ByteRangeLock) -> Result<LockState> {
+        if !self
+            .entries
+            .iter()
+            .any(|entry| Arc::ptr_eq(entry, &lock.state))
+        {
+            return Err(Error::Protocol(
+                "lock belongs to a different client or was already released".into(),
+            ));
+        }
+        Ok(lock.state.lock().unwrap().clone())
+    }
+
+    pub(crate) fn remove(&mut self, lock: &ByteRangeLock) {
+        self.entries
+            .retain(|entry| !Arc::ptr_eq(entry, &lock.state));
+    }
+
+    pub(crate) fn ensure_valid(&self) -> Result<()> {
+        for entry in &self.entries {
+            if let Some(status) = entry.lock().unwrap().lost {
+                return Err(Error::LockLost { status });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ByteRangeLock {
@@ -513,8 +619,15 @@ impl ByteRangeLock {
     }
 
     /// Returns the NFSv4 stateid for the byte-range lock.
+    /// Recovery updates this value. Do not use it after [`Self::is_lost`] is true.
     pub fn stateid(&self) -> StateId {
-        self.lock_stateid
+        self.state.lock().unwrap().lock_stateid
+    }
+
+    /// Returns true when recovery has established that this lock was lost.
+    /// A lost lock must not be used to protect further application work.
+    pub fn is_lost(&self) -> bool {
+        self.state.lock().unwrap().lost.is_some()
     }
 }
 

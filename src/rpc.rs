@@ -140,6 +140,7 @@ pub struct RpcClient {
     xid: u32,
     auth: Auth,
     max_record_size: usize,
+    interrupted: bool,
 }
 
 impl RpcClient {
@@ -161,6 +162,7 @@ impl RpcClient {
             xid: default_stamp(),
             auth,
             max_record_size: DEFAULT_MAX_RECORD_SIZE,
+            interrupted: false,
         })
     }
 
@@ -183,11 +185,32 @@ impl RpcClient {
         procedure: u32,
         args: &T,
     ) -> Result<Vec<u8>> {
+        if self.interrupted {
+            return Err(Error::RpcConnectionInvalid);
+        }
         let xid = self.next_xid();
         let request = encode_call(xid, program, version, procedure, &self.auth, args)?;
-        self.write_record(&request)?;
-        let reply = self.read_record()?;
-        decode_reply(xid, &reply)
+        self.interrupted = true;
+        self.write_record(&request)
+            .map_err(|err| Error::OutcomeUnknown(Box::new(err)))?;
+        let reply = self
+            .read_record()
+            .map_err(|err| Error::OutcomeUnknown(Box::new(err)))?;
+        match decode_reply(xid, &reply) {
+            Ok(payload) => {
+                self.interrupted = false;
+                Ok(payload)
+            }
+            Err(
+                err @ (Error::RpcDenied { .. }
+                | Error::RpcAcceptedError { .. }
+                | Error::RpcProgramMismatch { .. }),
+            ) => {
+                self.interrupted = false;
+                Err(err)
+            }
+            Err(err) => Err(Error::OutcomeUnknown(Box::new(err))),
+        }
     }
 
     fn next_xid(&mut self) -> u32 {
@@ -724,5 +747,42 @@ mod tests {
         encoder.write_u32(MSG_REPLY);
         encoder.write_u32(reply_stat);
         encoder
+    }
+}
+
+#[cfg(test)]
+mod interruption_tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    #[test]
+    fn partial_reply_timeout_requires_reconnect() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut marker = [0; 4];
+            stream.read_exact(&mut marker).unwrap();
+            let mut request = vec![0; (u32::from_be_bytes(marker) & FRAGMENT_LEN_MASK) as usize];
+            stream.read_exact(&mut request).unwrap();
+            stream.write_all(&[0x80, 0]).unwrap();
+            // The poisoned connection must not carry a second request.
+            assert_eq!(stream.read(&mut [0; 1]).unwrap(), 0);
+        });
+        let mut client =
+            RpcClient::connect_with_timeout(addr, Auth::none(), Some(Duration::from_millis(50)))
+                .unwrap();
+        let error = client.call(1, 1, 0, &()).unwrap_err();
+        assert!(error.is_outcome_unknown());
+        assert!(!error.is_retryable());
+        assert!(matches!(
+            client.call(1, 1, 0, &()),
+            Err(Error::RpcConnectionInvalid)
+        ));
+        drop(client);
+        peer.join().unwrap();
     }
 }
